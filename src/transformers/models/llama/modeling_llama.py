@@ -49,6 +49,9 @@ from ...utils import (
 )
 from .configuration_llama import LlamaConfig
 
+#test
+print("modification one.")
+
 
 logger = logging.get_logger(__name__)
 
@@ -182,6 +185,9 @@ class LlamaRotaryEmbedding(nn.Module):
         1 - growing beyond the cached sequence length (allow scaling)
         2 - the current sequence length is in the original scale (avoid losing precision with small sequences)
         """
+        #test
+        print("RoPE is being used!")
+
         seq_len = torch.max(position_ids) + 1
         if seq_len > self.max_seq_len_cached:  # growth
             inv_freq, self.attention_scaling = self.rope_init_fn(
