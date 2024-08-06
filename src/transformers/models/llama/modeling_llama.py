@@ -49,6 +49,8 @@ from ...utils import (
 )
 from .configuration_llama import LlamaConfig
 
+import LlamaYaRNScaledRotaryEmbedding as YaRNHelper
+
 #test
 print("modification one.")
 
@@ -132,6 +134,77 @@ class LlamaRMSNorm(nn.Module):
 
 
 ALL_LAYERNORM_LAYERS.append(LlamaRMSNorm)
+
+class LlamaYaRNScaledRotaryEmbedding(torch.nn.Module):
+    def __init__(
+            self, 
+            dim,
+            max_position_embeddings=2048,
+            base=10000,
+            device=None,
+            scale=1,
+            original_max_position_embeddings=2048,
+            extrapolation_factor=1,
+            attn_factor=1,
+            beta_fast=32,
+            beta_slow=1,
+            finetuned=False,
+            
+        ):
+            super().__init__()
+
+            self.dim = dim
+            self.max_position_embeddings = max_position_embeddings
+            self.base = base
+            self.scale = scale
+            self.original_max_position_embeddings = original_max_position_embeddings
+            self.extrapolation_factor = extrapolation_factor
+            self.attn_factor = attn_factor
+            self.beta_fast = beta_fast
+            self.beta_slow = beta_slow
+
+            self.yarn(device)
+
+            # Build here to make `torch.jit.trace` work.
+            self.max_seq_len_cached = max_position_embeddings
+            t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            # Different from paper, but it uses a different permutation in order to obtain the same calculation
+            emb = torch.cat((freqs, freqs), dim=-1)
+            dtype = torch.get_default_dtype()
+
+            self.register_buffer("cos_cached", (emb.cos() * self.mscale)[None, None, :, :].to(dtype), persistent=False)
+            self.register_buffer("sin_cached", (emb.sin() * self.mscale)[None, None, :, :].to(dtype), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        # This `if` block is unlikely to be run after we build sin/cos in `__init__`. Keep the logic here just in case.
+        if seq_len > self.max_seq_len_cached:
+            self.max_seq_len_cached = seq_len
+
+            t = torch.arange(self.max_seq_len_cached, device=x.device, dtype=self.inv_freq.dtype)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            # Different from paper, but it uses a different permutation in order to obtain the same calculation
+            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
+
+            self.register_buffer("cos_cached", (emb.cos() * self.mscale)[None, None, :, :].to(x.dtype), persistent=False)
+            self.register_buffer("sin_cached", (emb.sin() * self.mscale)[None, None, :, :].to(x.dtype), persistent=False)
+        return (
+            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+        )
+
+    def yarn(self, device):
+        pos_freqs = self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
+        inv_freq_extrapolation = 1.0 / pos_freqs
+        inv_freq_interpolation = 1.0 / (self.scale * pos_freqs)
+
+        low, high = YaRNHelper.find_correction_range(self.beta_fast, self.beta_slow, self.dim, self.base, self.original_max_position_embeddings)
+        inv_freq_mask = (1 - YaRNHelper.linear_ramp_mask(low, high, self.dim // 2).float().to(device)) * self.extrapolation_factor # Get n-d rotational scaling corrected for extrapolation
+        inv_freq = inv_freq_interpolation * (1 - inv_freq_mask) + inv_freq_extrapolation * inv_freq_mask
+
+        self.register_buffer("inv_freq", inv_freq)
+        self.mscale = float(YaRNHelper.get_mscale(self.scale) * self.attn_factor) # Get n-d magnitude scaling corrected for interpolation
 
 
 class LlamaRotaryEmbedding(nn.Module):
@@ -282,6 +355,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
+def apply_YARN(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    #how to apply YARN
+    return None
+
 
 class LlamaMLP(nn.Module):
     def __init__(self, config):
@@ -417,7 +494,14 @@ class LlamaAttention(nn.Module):
             cos, sin = self.rotary_emb(value_states, position_ids)
         else:
             cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        #decide which technique to use
+        
+        if True:
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        else:
+            query_states, key_slices = apply_YARN(query_states, key_slices, cos, sin)
+
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -909,6 +993,9 @@ class LlamaModel(LlamaPreTrainedModel):
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        if False:
+            self.rotary_emb = LlamaYaRNScaledRotaryEmbedding(config=config)
+        
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -981,6 +1068,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # TODO Yarn parameters differ: rope: foward(self, x, position_ids), YaRN: foward(self, x, seq_len=None)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
