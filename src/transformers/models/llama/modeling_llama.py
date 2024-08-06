@@ -54,6 +54,9 @@ import LlamaYaRNScaledRotaryEmbedding as YaRNHelper
 #test
 print("modification one.")
 
+def testFunction():
+    return "hello"
+
 
 logger = logging.get_logger(__name__)
 
