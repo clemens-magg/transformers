@@ -50,6 +50,7 @@ from ...utils import (
 from .configuration_llama import LlamaConfig
 
 import LlamaYaRNScaledRotaryEmbedding as YaRNHelper
+import ALiBi
 
 #test
 print("modification one.")
@@ -62,7 +63,7 @@ logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
 
-
+# TODO : ALiBi is integrated into the architecture by modifying the causal mask 
 def _prepare_4d_causal_attention_mask_with_cache_position(
     attention_mask: torch.Tensor,
     sequence_length: int,
@@ -95,6 +96,7 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
         batch_size (`torch.Tensor`):
             Batch size.
     """
+    #calc the bias matrix here?
     if attention_mask is not None and attention_mask.dim() == 4:
         # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
         causal_mask = attention_mask
@@ -358,10 +360,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
-def apply_YARN(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    #how to apply YARN
-    return None
-
 
 class LlamaMLP(nn.Module):
     def __init__(self, config):
@@ -443,9 +441,76 @@ class LlamaAttention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_bias)
+        self.__init__rope()
 
         # TODO (joao): remove in v4.45 (RoPE is computed in the model, not in the decoder layers)
-        self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
+        #self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
+
+    # Change rot. embedding depending on scaling_type, which can be adjusted in config.json file.
+    # stolen from Yarn repo: https://github.com/jquesnelle/yarn/blob/master/scaled_rope/modeling_llama_yarn.py
+    def _init_rope(self):
+        if self.config.rope_scaling is None:
+            self.rotary_emb = LlamaRotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=self.rope_theta,
+            )
+        else:
+            scaling_type = self.config.rope_scaling["type"]
+            scaling_factor = self.config.rope_scaling["factor"]
+            if scaling_type == "linear":
+                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                    base=self.rope_theta,
+                )
+            elif scaling_type == "dynamic":
+                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                    base=self.rope_theta,
+                )
+            elif scaling_type == "yarn":
+                original_max_position_embeddings = self.config.rope_scaling["original_max_position_embeddings"]
+                self.rotary_emb = LlamaYaRNScaledRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scale=scaling_factor,
+                    original_max_position_embeddings=original_max_position_embeddings
+                )
+            # elif scaling_type == "dynamic-yarn":
+            #     original_max_position_embeddings = self.config.rope_scaling["original_max_position_embeddings"]
+            #     self.rotary_emb = LlamaDynamicYaRNScaledRotaryEmbedding(
+            #         self.head_dim,
+            #         max_position_embeddings=self.max_position_embeddings,
+            #         original_max_position_embeddings=original_max_position_embeddings
+            #     )
+            #elif scaling_type == "alibi":
+                # self.rotary_emb = None # no positional information required
+                # # instead add bias matrix
+                # #attn_heads = args.decoer_attention_heads
+                # maxpos = args.tokens_per_sample
+                # attn_heads = args.decoder_attention_heads
+                # slopes = torch.Tensor(ALiBi.get_slopes(attn_heads))
+                # #In the next line, the part after the * is what constructs the diagonal matrix (right matrix in Figure 3 in the paper). 
+                # #If you run it you'll see that it doesn't exactly print out the same matrix as we have in Figure 3, but one where all rows are identical.
+                # #This works because the softmax operation is invariant to translation, and our bias functions are always linear. 
+                # alibi = self.slopes.unsqueeze(1).unsqueeze(1) * torch.arange(maxpos).unsqueeze(0).unsqueeze(0).expand(attn_heads, -1, -1)
+                # alibi = self.alibi.view(attn_heads, 1, maxpos)
+                # alibi = self.alibi.repeat(args.max_tokens//maxpos, 1, 1)  # batch_size, 1, 1
+
+                # TODO: i have no args, can i supply them via config.json?
+
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+
+                # TODO add more techniques here
+
+    # No use for this function. 
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
     def forward(
         self,
@@ -487,6 +552,16 @@ class LlamaAttention(nn.Module):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            if self.layer_idx is None:
+                raise ValueError(
+                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                    "with a layer index."
+                )
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        
         if position_embeddings is None:
             logger.warning_once(
                 "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
@@ -494,17 +569,11 @@ class LlamaAttention(nn.Module):
                 "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
                 "removed and `position_embeddings` will be mandatory."
             )
-            cos, sin = self.rotary_emb(value_states, position_ids)
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len) # originally: position_ids (Yarn uses different RoPE baseline)
         else:
-            cos, sin = position_embeddings
-
-        #decide which technique to use
-        
-        if True:
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        else:
-            query_states, key_slices = apply_YARN(query_states, key_slices, cos, sin)
-
+            cos, sin = position_embeddings        
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+       
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -595,6 +664,10 @@ class LlamaFlashAttention2(LlamaAttention):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        
         if position_embeddings is None:
             logger.warning_once(
                 "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
@@ -602,10 +675,10 @@ class LlamaFlashAttention2(LlamaAttention):
                 "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
                 "removed and `position_embeddings` will be mandatory."
             )
-            cos, sin = self.rotary_emb(value_states, position_ids)
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len) # originally: position_ids (Yarn uses different RoPE baseline)
         else:
             cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -715,6 +788,10 @@ class LlamaSdpaAttention(LlamaAttention):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        
         if position_embeddings is None:
             logger.warning_once(
                 "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
@@ -722,10 +799,10 @@ class LlamaSdpaAttention(LlamaAttention):
                 "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
                 "removed and `position_embeddings` will be mandatory."
             )
-            cos, sin = self.rotary_emb(value_states, position_ids)
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len) # originally: position_ids (Yarn uses different RoPE baseline)
         else:
             cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
