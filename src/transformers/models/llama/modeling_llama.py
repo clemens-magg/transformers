@@ -49,8 +49,8 @@ from ...utils import (
 )
 from .configuration_llama import LlamaConfig
 
-import LlamaYaRNScaledRotaryEmbedding as YaRNHelper
-import ALiBi
+#import LlamaYaRNScaledRotaryEmbedding as YaRNHelper
+#import ALiBi
 
 #test
 print("modification one.")
@@ -116,6 +116,35 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
             )
 
     return causal_mask
+
+
+# YaRN helper functions
+
+# Inverse dim formula to find dim based on number of rotations
+def find_correction_dim(num_rotations, dim, base=10000, max_position_embeddings=2048):
+    return (dim * math.log(max_position_embeddings/(num_rotations * 2 * math.pi)))/(2 * math.log(base))
+
+# Find dim range bounds based on rotations
+def find_correction_range(low_rot, high_rot, dim, base=10000, max_position_embeddings=2048):
+    low = math.floor(find_correction_dim(
+        low_rot, dim, base, max_position_embeddings))
+    high = math.ceil(find_correction_dim(
+        high_rot, dim, base, max_position_embeddings))
+    return max(low, 0), min(high, dim-1)  # Clamp values just in case
+
+def linear_ramp_mask(min, max, dim):
+    if min == max:
+        max += 0.001  # Prevent singularity
+
+    linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+    ramp_func = torch.clamp(linear_func, 0, 1)
+    return ramp_func
+
+def get_mscale(scale=1):
+    if scale <= 1:
+        return 1.0
+    return 0.1 * math.log(scale) + 1.0
+
 
 
 class LlamaRMSNorm(nn.Module):
@@ -204,12 +233,12 @@ class LlamaYaRNScaledRotaryEmbedding(torch.nn.Module):
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (self.scale * pos_freqs)
 
-        low, high = YaRNHelper.find_correction_range(self.beta_fast, self.beta_slow, self.dim, self.base, self.original_max_position_embeddings)
-        inv_freq_mask = (1 - YaRNHelper.linear_ramp_mask(low, high, self.dim // 2).float().to(device)) * self.extrapolation_factor # Get n-d rotational scaling corrected for extrapolation
+        low, high = find_correction_range(self.beta_fast, self.beta_slow, self.dim, self.base, self.original_max_position_embeddings)
+        inv_freq_mask = (1 - linear_ramp_mask(low, high, self.dim // 2).float().to(device)) * self.extrapolation_factor # Get n-d rotational scaling corrected for extrapolation
         inv_freq = inv_freq_interpolation * (1 - inv_freq_mask) + inv_freq_extrapolation * inv_freq_mask
 
         self.register_buffer("inv_freq", inv_freq)
-        self.mscale = float(YaRNHelper.get_mscale(self.scale) * self.attn_factor) # Get n-d magnitude scaling corrected for interpolation
+        self.mscale = float(get_mscale(self.scale) * self.attn_factor) # Get n-d magnitude scaling corrected for interpolation
 
 
 class LlamaRotaryEmbedding(nn.Module):
