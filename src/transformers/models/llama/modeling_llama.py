@@ -58,6 +58,8 @@ print("modification one.")
 def testFunction():
     return "hello"
 
+#just for a test
+usingRope = True
 
 logger = logging.get_logger(__name__)
 
@@ -470,7 +472,7 @@ class LlamaAttention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_bias)
-        self.__init__rope()
+        self._init_rope()
 
         # TODO (joao): remove in v4.45 (RoPE is computed in the model, not in the decoder layers)
         #self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
@@ -487,6 +489,8 @@ class LlamaAttention(nn.Module):
         else:
             scaling_type = self.config.rope_scaling["type"]
             scaling_factor = self.config.rope_scaling["factor"]
+            if scaling_type == "":
+                self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
             if scaling_type == "linear":
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim,
@@ -502,6 +506,8 @@ class LlamaAttention(nn.Module):
                     base=self.rope_theta,
                 )
             elif scaling_type == "yarn":
+                #Test
+                usingRope = False
                 original_max_position_embeddings = self.config.rope_scaling["original_max_position_embeddings"]
                 self.rotary_emb = LlamaYaRNScaledRotaryEmbedding(
                     self.head_dim,
@@ -598,6 +604,7 @@ class LlamaAttention(nn.Module):
                 "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
                 "removed and `position_embeddings` will be mandatory."
             )
+
             cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len) # originally: position_ids (Yarn uses different RoPE baseline)
         else:
             cos, sin = position_embeddings        
