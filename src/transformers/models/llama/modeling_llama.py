@@ -473,6 +473,7 @@ class LlamaAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_bias)
         self._init_rope()
+        self._init_rope()
 
         # TODO (joao): remove in v4.45 (RoPE is computed in the model, not in the decoder layers)
         #self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
@@ -487,7 +488,7 @@ class LlamaAttention(nn.Module):
                 base=self.rope_theta,
             )
         else:
-            scaling_type = self.config.rope_scaling["type"]
+            scaling_type = self.config.rope_scaling["rope_type"]
             scaling_factor = self.config.rope_scaling["factor"]
             if scaling_type == "":
                 self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
@@ -506,6 +507,7 @@ class LlamaAttention(nn.Module):
                     base=self.rope_theta,
                 )
             elif scaling_type == "yarn":
+                #might need to change this parameter in the config file for longer sequences?
                 #Test
                 usingRope = False
                 original_max_position_embeddings = self.config.rope_scaling["original_max_position_embeddings"]
