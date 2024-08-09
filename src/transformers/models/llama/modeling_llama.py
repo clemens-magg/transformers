@@ -473,7 +473,6 @@ class LlamaAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_bias)
         self._init_rope()
-        self._init_rope()
 
         # TODO (joao): remove in v4.45 (RoPE is computed in the model, not in the decoder layers)
         #self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
